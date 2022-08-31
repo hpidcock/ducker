@@ -7,7 +7,7 @@ version: git
 grade: stable
 base: core20
 
-confinement: devmode
+confinement: strict
 
 apps:
   ducker:
@@ -16,6 +16,7 @@ apps:
       - network
       - network-bind
     daemon: simple
+  
 parts:
   ducker:
     plugin: go

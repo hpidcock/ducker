@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/docker/docker/errdefs"
 	"gopkg.in/yaml.v2"
 )
@@ -52,11 +56,37 @@ func ReadConfig(file string) (*Config, error) {
 		return nil, err
 	}
 
+	if os.Getenv("SNAP_NAME") == "ducker" {
+		cmd := exec.Command("snapctl", "get", "env", "-d")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, err
+		}
+		kv := map[string]string{}
+		err = json.Unmarshal(out, &kv)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range kv {
+			k = strings.ToUpper(strings.ReplaceAll(k, "-", "_"))
+			os.Setenv(k, v)
+		}
+	}
+
 	config := &Config{}
 	err = yaml.Unmarshal(data, config)
 	if err != nil {
 		return nil, err
 	}
+	config.Listen = os.ExpandEnv(config.Listen)
+	config.Namespace = os.ExpandEnv(config.Namespace)
+	config.SSH.KeyPair = os.ExpandEnv(config.SSH.KeyPair)
+	config.SSH.IdentityFile = os.ExpandEnv(config.SSH.IdentityFile)
+	config.AWS.Region = os.ExpandEnv(config.AWS.Region)
+	config.AWS.AccessKeyId = os.ExpandEnv(config.AWS.AccessKeyId)
+	config.AWS.SecretAccessKey = os.ExpandEnv(config.AWS.SecretAccessKey)
+
+	spew.Dump(config)
 
 	return config, nil
 }
