@@ -233,7 +233,7 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 
 	destPath := fmt.Sprintf("/tmp/ducker-%s", petname.Generate(3, "-"))
 
-	logrus.Infof("copying to %s:%s", host, destPath)
+	logrus.Infof("%s: copying to %s:%s", name, host, destPath)
 
 	opts := ssh.Options{}
 	opts.SetIdentities(b.config.SSH.IdentityFile)
@@ -243,7 +243,7 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 		return err
 	}
 
-	logrus.Infof("extracting %s:%s to %s:%s", host, destPath, host, path)
+	logrus.Infof("%s: extracting %s:%s to %s:%s", name, host, destPath, host, path)
 
 	cmd := ssh.Command(host, []string{"sudo", "tar", "-xvf", destPath, "-C", path}, &opts)
 	out, err := cmd.CombinedOutput()
@@ -346,27 +346,27 @@ func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container
 	}
 	id := *resp.Instances[0].InstanceId
 
-	logrus.Debugf("waiting for %s", id)
+	logrus.Debugf("%s: waiting", id)
 	info, err := b.waitForRunningInfo(context.Background(), id)
 	if err != nil {
 		return container.ContainerCreateCreatedBody{}, err
 	}
 
-	logrus.Debugf("waiting for %s cloud-init", id)
+	logrus.Debugf("%s: waiting for cloud-init", id)
 	err = b.waitForCloudInit(context.Background(), info)
 	if err != nil {
 		return container.ContainerCreateCreatedBody{}, err
 	}
 
 	if info.Image.StartScript != "" {
-		logrus.Debugf("running %s start-script", id)
+		logrus.Debugf("%s: running start-script", id)
 		host := info.Image.DefaultUser + "@" + info.IP
 		opts := ssh.Options{}
 		opts.SetIdentities(b.config.SSH.IdentityFile)
 		opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
 		cmd := ssh.Command(host, []string{"/bin/bash", "-c", utils.ShQuote(info.Image.StartScript)}, &opts)
 		out, err := cmd.CombinedOutput()
-		logrus.Debugln(string(out))
+		logrus.Debugf("%s: start-script output: %s", id, string(out))
 		if err != nil {
 			return container.ContainerCreateCreatedBody{}, err
 		}

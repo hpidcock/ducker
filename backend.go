@@ -110,7 +110,11 @@ func (b *Backend) waitForRunningInfo(ctx context.Context, name string) (*running
 			InstanceIds: []string{name},
 		})
 		if err != nil {
-			return nil, err
+			if !attempt.More() {
+				return nil, err
+			} else {
+				logrus.Warnf("%s: waiting for info: %s", name, err.Error())
+			}
 		}
 		instance := res.Reservations[0].Instances[0]
 		if instance.PublicIpAddress == nil {
