@@ -62,12 +62,14 @@ func ReadConfig(file string) (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		kv := map[string]string{}
+		kv := struct {
+			Env map[string]string `json:"env"`
+		}{}
 		err = json.Unmarshal(out, &kv)
 		if err != nil {
 			return nil, err
 		}
-		for k, v := range kv {
+		for k, v := range kv.Env {
 			k = strings.ToUpper(strings.ReplaceAll(k, "-", "_"))
 			os.Setenv(k, v)
 		}
