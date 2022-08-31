@@ -76,7 +76,7 @@ func (b *Backend) waitForCloudInit(ctx context.Context, info *runningInfo) error
 		cmd := ssh.Command(host, []string{"/bin/bash", "-c", "hostname"}, &opts)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			logrus.Errorf("%s: hostname failed: %s", info.Name, string(out))
+			logrus.Errorf("%s: hostname failed: %s\n%s", info.Name, err.Error(), string(out))
 			if !attempt.More() {
 				return err
 			}
