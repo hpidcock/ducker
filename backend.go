@@ -114,6 +114,7 @@ func (b *Backend) waitForRunningInfo(ctx context.Context, name string) (*running
 				return nil, err
 			} else {
 				logrus.Warnf("%s: waiting for info: %s", name, err.Error())
+				continue
 			}
 		}
 		instance := res.Reservations[0].Instances[0]
