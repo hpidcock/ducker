@@ -24,3 +24,7 @@ parts:
     source: https://github.com/hpidcock/ducker
     stage-packages:
       - openssh-client
+
+layout:
+  /root/.ssh:
+    bind: $SNAP_COMMON/.ssh
