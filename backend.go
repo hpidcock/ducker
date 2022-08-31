@@ -10,9 +10,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/errdefs"
-	"github.com/juju/utils/v3"
 	"github.com/juju/utils/v3/ssh"
 	"github.com/sirupsen/logrus"
+	"gopkg.in/retry.v1"
 )
 
 // createContainer
@@ -56,6 +56,14 @@ var (
 	errNotImplemented = errdefs.NotImplemented(fmt.Errorf("not implemented"))
 )
 
+var (
+	retryStrategy = retry.LimitCount(10, retry.Exponential{
+		Initial:  time.Second,
+		Factor:   2.0,
+		MaxDelay: 30 * time.Second,
+	})
+)
+
 func (b *Backend) waitForCloudInit(ctx context.Context, info *runningInfo) error {
 	host := info.Image.DefaultUser + "@" + info.IP
 
@@ -63,16 +71,13 @@ func (b *Backend) waitForCloudInit(ctx context.Context, info *runningInfo) error
 	opts.SetIdentities(b.config.SSH.IdentityFile)
 	opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
 
-	attempts := utils.AttemptStrategy{
-		Total: 2 * time.Minute,
-		Min:   10,
-		Delay: time.Second,
-	}.Start()
-	for attempts.Next() {
+	attempt := retry.Start(retryStrategy, nil)
+	for attempt.Next() {
 		cmd := ssh.Command(host, []string{"/bin/bash", "-c", "hostname"}, &opts)
-		_, err := cmd.CombinedOutput()
+		out, err := cmd.CombinedOutput()
 		if err != nil {
-			if !attempts.HasNext() {
+			logrus.Errorf("%s: hostname failed: %s", info.Name, string(out))
+			if !attempt.More() {
 				return err
 			}
 			continue
@@ -82,26 +87,25 @@ func (b *Backend) waitForCloudInit(ctx context.Context, info *runningInfo) error
 
 	cmd := ssh.Command(host, []string{"sudo", "cloud-init", "status", "--wait"}, &opts)
 	out, err := cmd.CombinedOutput()
-	logrus.Debugln(string(out))
 	if err != nil {
+		logrus.Errorf("%s: cloud-init failed: %s", info.Name, string(out))
 		return err
 	}
 	return nil
 }
 
 type runningInfo struct {
+	Name  string
 	IP    string
 	Image *ImageConfig
 }
 
 func (b *Backend) waitForRunningInfo(ctx context.Context, name string) (*runningInfo, error) {
-	info := runningInfo{}
-	attempts := utils.AttemptStrategy{
-		Total: 2 * time.Minute,
-		Min:   10,
-		Delay: time.Second,
-	}.Start()
-	for attempts.Next() {
+	info := runningInfo{
+		Name: name,
+	}
+	attempt := retry.Start(retryStrategy, nil)
+	for attempt.Next() {
 		res, err := b.client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 			InstanceIds: []string{name},
 		})

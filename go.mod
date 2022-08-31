@@ -16,6 +16,7 @@ require (
 	github.com/opencontainers/image-spec v1.0.3-0.20211202183452-c5a74bcca799
 	github.com/sirupsen/logrus v1.9.0
 	golang.org/x/crypto v0.0.0-20220826181053-bd7e27e6170d
+	gopkg.in/retry.v1 v1.0.3
 	gopkg.in/yaml.v2 v2.4.0
 )
 

@@ -1,0 +1,23 @@
+name: ducker
+summary: a hacky quacky dockerd for cloud VMs 
+description: |
+  A dockerd "compatible" daemon used for provisioning VMs.
+  Intended to be used with the docker jenkins plugin. 
+version: git
+grade: stable
+base: core20
+
+confinement: devmode
+
+apps:
+  ducker:
+    command: bin/ducker $SNAP_COMMON/config.yaml
+    plugs:
+      - network
+      - network-bind
+    daemon: simple
+parts:
+  ducker:
+    plugin: go
+    source-type: git
+    source: https://github.com/hpidcock/ducker 
