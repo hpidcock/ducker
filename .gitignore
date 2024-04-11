@@ -1,3 +1,4 @@
 test.yaml
 prod.yaml
 prime/
+*.snap

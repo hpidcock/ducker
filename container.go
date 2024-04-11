@@ -347,7 +347,8 @@ func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container
 		}}
 
 		resp, err := b.client.RunInstances(context.Background(), req)
-		if err != nil && strings.Contains(err.Error(), "InsufficientInstanceCapacity") {
+		if err != nil && (strings.Contains(err.Error(), "InsufficientInstanceCapacity") ||
+			strings.Contains(err.Error(), "Unsupported")) {
 			logrus.Errorf("retrying due to failure creating instance: %s", err.Error())
 			continue
 		} else if err != nil {
