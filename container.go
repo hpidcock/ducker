@@ -306,45 +306,60 @@ func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container
 	if len(subnets.Subnets) == 0 {
 		return container.ContainerCreateCreatedBody{}, errdefs.NotFound(fmt.Errorf("no subnets found"))
 	}
-	subnetId := *subnets.Subnets[rand.Intn(len(subnets.Subnets)-1)].SubnetId
+	rand.Shuffle(len(subnets.Subnets), func(i, j int) {
+		subnets.Subnets[i], subnets.Subnets[j] = subnets.Subnets[j], subnets.Subnets[i]
+	})
 
-	req := &ec2.RunInstancesInput{
-		MaxCount:         aws.Int32(1),
-		MinCount:         aws.Int32(1),
-		ImageId:          aws.String(ami),
-		InstanceType:     ec2types.InstanceType(image.InstanceType),
-		KeyName:          aws.String(b.config.SSH.KeyPair),
-		SecurityGroupIds: image.SecurityGroups,
-		SubnetId:         aws.String(subnetId),
-	}
-	if image.IAMInstanceProfile != "" {
-		req.IamInstanceProfile = &ec2types.IamInstanceProfileSpecification{
-			Arn: aws.String(image.IAMInstanceProfile),
+	id := ""
+	for _, subnet := range subnets.Subnets {
+		subnetId := *subnet.SubnetId
+
+		req := &ec2.RunInstancesInput{
+			MaxCount:         aws.Int32(1),
+			MinCount:         aws.Int32(1),
+			ImageId:          aws.String(ami),
+			InstanceType:     ec2types.InstanceType(image.InstanceType),
+			KeyName:          aws.String(b.config.SSH.KeyPair),
+			SecurityGroupIds: image.SecurityGroups,
+			SubnetId:         aws.String(subnetId),
 		}
-	}
-	if image.UserData != "" {
-		req.UserData = aws.String(image.UserData)
-	}
+		if image.IAMInstanceProfile != "" {
+			req.IamInstanceProfile = &ec2types.IamInstanceProfileSpecification{
+				Arn: aws.String(image.IAMInstanceProfile),
+			}
+		}
+		if image.UserData != "" {
+			req.UserData = aws.String(image.UserData)
+		}
 
-	tags := []ec2types.Tag{
-		{Key: aws.String("Name"), Value: aws.String(config.Name)},
-		{Key: aws.String("ducker"), Value: aws.String(b.config.Namespace)},
-		{Key: aws.String("image"), Value: aws.String(imageName)},
-	}
-	for k, v := range config.Config.Labels {
-		tags = append(tags, ec2types.Tag{Key: aws.String(k), Value: aws.String(v)})
-	}
+		tags := []ec2types.Tag{
+			{Key: aws.String("Name"), Value: aws.String(config.Name)},
+			{Key: aws.String("ducker"), Value: aws.String(b.config.Namespace)},
+			{Key: aws.String("image"), Value: aws.String(imageName)},
+		}
+		for k, v := range config.Config.Labels {
+			tags = append(tags, ec2types.Tag{Key: aws.String(k), Value: aws.String(v)})
+		}
 
-	req.TagSpecifications = []ec2types.TagSpecification{{
-		ResourceType: ec2types.ResourceTypeInstance,
-		Tags:         tags,
-	}}
+		req.TagSpecifications = []ec2types.TagSpecification{{
+			ResourceType: ec2types.ResourceTypeInstance,
+			Tags:         tags,
+		}}
 
-	resp, err := b.client.RunInstances(context.Background(), req)
-	if err != nil {
-		return container.ContainerCreateCreatedBody{}, err
+		resp, err := b.client.RunInstances(context.Background(), req)
+		if err != nil && strings.Contains(err.Error(), "InsufficientInstanceCapacity") {
+			logrus.Errorf("retrying due to failure creating instance: %s", err.Error())
+			continue
+		} else if err != nil {
+			return container.ContainerCreateCreatedBody{}, err
+		}
+
+		id = *resp.Instances[0].InstanceId
+		break
 	}
-	id := *resp.Instances[0].InstanceId
+	if id == "" {
+		return container.ContainerCreateCreatedBody{}, errdefs.Deadline(fmt.Errorf("failed to create container"))
+	}
 
 	logrus.Debugf("%s: waiting", id)
 	info, err := b.waitForRunningInfo(context.Background(), id)
