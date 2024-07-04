@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +18,10 @@ import (
 	"github.com/docker/docker/errdefs"
 	petname "github.com/dustinkirkland/golang-petname"
 	"github.com/juju/errors"
-	"github.com/juju/utils/v3"
-	"github.com/juju/utils/v3/ssh"
 	"github.com/juju/worker/v3"
+	"github.com/kballard/go-shellquote"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
 	"gopkg.in/tomb.v2"
 )
 
@@ -50,9 +51,10 @@ type Instance interface {
 }
 
 type RunningInfo struct {
-	Name  string
-	IP    string
-	Image *ImageConfig
+	Name    string
+	IP      string
+	HostKey ssh.PublicKey
+	Image   *ImageConfig
 }
 
 type InstanceState int
@@ -77,10 +79,13 @@ type awsInstance struct {
 	changeState chan InstanceState
 	runFunc     chan func() bool
 
-	id       string
-	name     string
-	ip       string
-	nonce    string
+	name string
+	id   string
+
+	ip      string
+	nonce   string
+	hostKey ssh.PublicKey
+
 	created  time.Time
 	started  time.Time
 	finished time.Time
@@ -132,9 +137,10 @@ func (n *awsInstance) RunningInfo(ctx context.Context) (*RunningInfo, error) {
 			return true
 		case Running:
 			runningInfo = &RunningInfo{
-				Name:  n.id,
-				IP:    n.ip,
-				Image: &n.image,
+				Name:    n.id,
+				IP:      n.ip,
+				Image:   &n.image,
+				HostKey: n.hostKey,
 			}
 		}
 		close(done)
@@ -304,14 +310,28 @@ func (n *awsInstance) enterCloudInit() error {
 }
 
 func (n *awsInstance) cloudInit() error {
-	host := n.image.DefaultUser + "@" + n.ip
+	var recordedHostKey ssh.PublicKey
+	conn, err := ssh.Dial("tcp", net.JoinHostPort(n.ip, "22"), &ssh.ClientConfig{
+		User: n.image.DefaultUser,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(n.b.signers...),
+		},
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			recordedHostKey = key
+			return nil
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("cannot open connection: %w", err)
+	}
+	defer conn.Close()
 
-	opts := ssh.Options{}
-	opts.SetIdentities(n.b.config.SSH.IdentityFile)
-	opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
-
-	cmd := ssh.Command(host, []string{"cat", noncePath}, &opts)
-	out, err := cmd.CombinedOutput()
+	logrus.Infof("%s: confirming host key...", n.id)
+	sess, err := conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("cannot open session: %w", err)
+	}
+	out, err := sess.CombinedOutput(fmt.Sprintf("cat %s", noncePath))
 	if err != nil {
 		return fmt.Errorf("nonce check failed: %w\n%s", err, string(out))
 	}
@@ -319,19 +339,29 @@ func (n *awsInstance) cloudInit() error {
 	if !strings.Contains(maybeNonce, n.nonce) {
 		return fmt.Errorf("cannot verify instance nonce: wanted %s got %s", n.nonce, maybeNonce)
 	}
+	logrus.Infof("%s: confirmed host key %s via cloud-init nonce", n.id, ssh.FingerprintSHA256(recordedHostKey))
+	n.hostKey = recordedHostKey
 
-	cmd = ssh.Command(host, []string{"sudo", "cloud-init", "status", "--wait"}, &opts)
-	out, err = cmd.CombinedOutput()
+	logrus.Infof("%s: waiting for cloud init...", n.id)
+	sess, err = conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("cannot open session: %w", err)
+	}
+	out, err = sess.CombinedOutput("sudo cloud-init status --wait")
 	if err != nil {
 		return fmt.Errorf("cloud-init failed: %w\n%s", err, string(out))
 	}
 
 	if !n.runStartScript && n.image.StartScript != "" {
-		cmd := ssh.Command(host, []string{"/bin/bash", "-c", utils.ShQuote(n.image.StartScript)}, &opts)
-		out, err := cmd.CombinedOutput()
+		logrus.Infof("%s: running start-script...", n.id)
+		sess, err = conn.NewSession()
+		if err != nil {
+			return fmt.Errorf("cannot open session: %w", err)
+		}
+		out, err := sess.CombinedOutput(fmt.Sprintf("/bin/bash -c %s", shellquote.Join(n.image.StartScript)))
 		logrus.Debugf("%s: start-script output: %s", n.id, string(out))
 		if err != nil {
-			return err
+			return fmt.Errorf("start-script failed: %w", err)
 		}
 		n.runStartScript = true
 	}
@@ -595,6 +625,7 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 	if id == "" {
 		return errdefs.Deadline(fmt.Errorf("failed to create container"))
 	}
+
 	n.id = id
 	n.name = config.Name
 	n.image = image

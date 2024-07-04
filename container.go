@@ -1,14 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"math/rand"
-	"os/exec"
+	"net"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -20,13 +20,11 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/archive"
 	petname "github.com/dustinkirkland/golang-petname"
-	"github.com/juju/cmd/v3"
 	"github.com/juju/errors"
-	"github.com/juju/utils/v3/ssh"
 	"github.com/juju/worker/v3"
 	"github.com/kballard/go-shellquote"
 	"github.com/sirupsen/logrus"
-	cryptossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v2"
 )
 
@@ -122,43 +120,34 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 		// TODO: find image config and get username from there
 		user = info.Image.DefaultUser
 	}
-	host := user + "@" + info.IP
 
-	opts := ssh.Options{}
-	opts.SetIdentities(b.config.SSH.IdentityFile)
-	opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
-	sshCmd := ssh.DefaultClient.Command(host, execConfig.Config.Cmd, &opts)
+	conn, err := ssh.Dial("tcp", net.JoinHostPort(info.IP, "22"), &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(b.signers...),
+		},
+		HostKeyCallback: ssh.FixedHostKey(info.HostKey),
+	})
+	if err != nil {
+		return fmt.Errorf("cannot open connection: %w", err)
+	}
+	defer conn.Close()
+
+	sess, err := conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("cannot open session: %w", err)
+	}
+
 	if execConfig.Config.AttachStdin && stdin != nil {
-		w, err := sshCmd.StdinPipe()
-		if err != nil {
-			return err
-		}
-		go func() {
-			defer w.Close()
-			io.Copy(w, stdin)
-		}()
+		sess.Stdin = stdin
 	}
 	if execConfig.Config.AttachStdout && stdout != nil {
-		r, err := sshCmd.StdoutPipe()
-		if err != nil {
-			return err
-		}
-		go func() {
-			defer r.Close()
-			io.Copy(stdout, r)
-		}()
+		sess.Stdout = stdout
 	}
 	if execConfig.Config.AttachStderr && stderr != nil {
-		r, err := sshCmd.StderrPipe()
-		if err != nil {
-			return err
-		}
-		go func() {
-			defer r.Close()
-			io.Copy(stderr, r)
-		}()
+		sess.Stderr = stderr
 	}
-	err = sshCmd.Start()
+	err = sess.Start(shellquote.Join(execConfig.Config.Cmd...))
 	if err != nil {
 		return err
 	}
@@ -170,8 +159,23 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 	}
 	b.execsMutex.Unlock()
 
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			logrus.Infof("canceling exec %s", execConfig.ID)
+			err := sess.Signal(ssh.SIGINT)
+			if err != nil {
+				logrus.Infof("canceling exec %s: %v", execConfig.ID, err)
+			}
+		case <-done:
+			logrus.Infof("exiting exec %s", execConfig.ID)
+		}
+	}()
+
 	logrus.Debugf("exec %s waiting", name)
-	err = sshCmd.Wait()
+	err = sess.Wait()
 	logrus.Debugf("exec %s exited with %v", name, err)
 	exitCode := 0
 	defer func() {
@@ -183,12 +187,8 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 			b.execs[name] = updateExecConfig
 		}
 	}()
-	if execErr, ok := err.(*exec.ExitError); ok {
-		exitCode = execErr.ExitCode()
-	} else if rcErr, ok := err.(*cmd.RcPassthroughError); ok {
-		exitCode = rcErr.Code
-	} else if goSSHerr, ok := err.(*cryptossh.ExitError); ok {
-		exitCode = goSSHerr.ExitStatus()
+	if sshErr, ok := err.(*ssh.ExitError); ok {
+		exitCode = sshErr.ExitStatus()
 	} else if err != nil {
 		return err
 	}
@@ -241,18 +241,38 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 
 	logrus.Infof("%s: copying to %s:%s", name, host, destPath)
 
-	opts := ssh.Options{}
-	opts.SetIdentities(b.config.SSH.IdentityFile)
-	opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
-	err = ssh.CopyReader(host, destPath, content, &opts)
+	conn, err := ssh.Dial("tcp", net.JoinHostPort(info.IP, "22"), &ssh.ClientConfig{
+		User: info.Image.DefaultUser,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(b.signers...),
+		},
+		HostKeyCallback: ssh.FixedHostKey(info.HostKey),
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot open connection: %w", err)
+	}
+	defer conn.Close()
+
+	sess, err := conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("cannot open session: %w", err)
+	}
+	sess.Stdin = content
+	combined := &bytes.Buffer{}
+	sess.Stderr = combined
+	sess.Stdout = combined
+	err = sess.Run(fmt.Sprintf("cat - > %s", destPath))
+	if err != nil {
+		return fmt.Errorf("cannot write file %s: %w\n%s", destPath, err, combined.String())
 	}
 
 	logrus.Infof("%s: extracting %s:%s to %s:%s", name, host, destPath, host, path)
-
-	cmd := ssh.Command(host, []string{"sudo", "tar", "-xvf", destPath, "-C", path}, &opts)
-	out, err := cmd.CombinedOutput()
+	sess, err = conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("cannot open session: %w", err)
+	}
+	out, err := sess.CombinedOutput(fmt.Sprintf(
+		"sudo tar -xvf %s -C %s", destPath, shellquote.Join(path)))
 	logrus.Debugln(string(out))
 	if err != nil {
 		return err
@@ -262,35 +282,34 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 
 func (b *Backend) ContainerStatPath(name string, path string) (*types.ContainerPathStat, error) {
 	logrus.Infof("ContainerStatPath %s %s", name, path)
-	if !strings.HasPrefix(name, "i-") {
-		return nil, errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
-	}
-
-	done := make(chan struct{})
-	close(done)
-	worker, err := b.runner.Worker(name, done)
-	if errors.Is(err, errors.NotFound) {
-		return nil, errdefs.NotFound(fmt.Errorf("container %q not found", name))
-	} else if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	instance := worker.(Instance)
-	ri, err := instance.RunningInfo(ctx)
+	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO: find image config and get username from there
-	host := ri.Image.DefaultUser + "@" + ri.IP
+	ri, err := instance.RunningInfo(context.Background())
+	if err != nil {
+		return nil, err
+	}
 
-	opts := ssh.Options{}
-	opts.SetIdentities(b.config.SSH.IdentityFile)
-	opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
-	cmd := ssh.Command(host, []string{"stat", "-c", shellquote.Join("name: %n\nmode: %f\nsize: %s\nmod: %Y\ntype: %F\n"), path}, &opts)
-	out, err := cmd.CombinedOutput()
+	conn, err := ssh.Dial("tcp", net.JoinHostPort(ri.IP, "22"), &ssh.ClientConfig{
+		User: ri.Image.DefaultUser,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(b.signers...),
+		},
+		HostKeyCallback: ssh.FixedHostKey(ri.HostKey),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cannot open connection: %w", err)
+	}
+	defer conn.Close()
+
+	sess, err := conn.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("cannot open session: %w", err)
+	}
+
+	out, err := sess.CombinedOutput(fmt.Sprintf("stat -c %s", shellquote.Join("name: %n\nmode: %f\nsize: %s\nmod: %Y\ntype: %F\n", path)))
 	logrus.Debugln(string(out))
 	if err != nil {
 		return nil, err

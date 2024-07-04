@@ -17,6 +17,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/juju/worker/v3"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh"
 )
 
 // createContainer
@@ -41,8 +42,9 @@ import (
 // removeImage?
 
 type Backend struct {
-	client *ec2.Client
-	config *Config
+	client  *ec2.Client
+	config  *Config
+	signers []ssh.Signer
 
 	execsMutex sync.Mutex
 	execs      map[string]Exec

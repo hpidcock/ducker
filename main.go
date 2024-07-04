@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/signal"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/juju/clock"
 	"github.com/juju/worker/v3"
 	"github.com/sirupsen/logrus"
+	ssh "golang.org/x/crypto/ssh"
 )
 
 func main() {
@@ -76,6 +78,15 @@ func run(cfg *Config) error {
 		return fmt.Errorf("cannot cleanup existing instances: %w", err)
 	}
 
+	key, err := ioutil.ReadFile(cfg.SSH.IdentityFile)
+	if err != nil {
+		return fmt.Errorf("cannot parse key file %s: %w", cfg.SSH.IdentityFile, err)
+	}
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return fmt.Errorf("cannot parse key file %s: %w", cfg.SSH.IdentityFile, err)
+	}
+
 	runner := worker.NewRunner(worker.RunnerParams{
 		IsFatal: func(err error) bool {
 			return false
@@ -94,11 +105,12 @@ func run(cfg *Config) error {
 		}
 	}()
 	backend := &Backend{
-		client: ec2Client,
-		config: cfg,
-		execs:  map[string]Exec{},
-		names:  map[string]string{},
-		runner: runner,
+		client:  ec2Client,
+		signers: []ssh.Signer{signer},
+		config:  cfg,
+		execs:   map[string]Exec{},
+		names:   map[string]string{},
+		runner:  runner,
 	}
 
 	decoder := runconfig.ContainerDecoder{
