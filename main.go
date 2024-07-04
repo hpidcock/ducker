@@ -17,6 +17,8 @@ import (
 	"github.com/docker/docker/daemon/listeners"
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/runconfig"
+	"github.com/juju/clock"
+	"github.com/juju/worker/v3"
 	"github.com/sirupsen/logrus"
 )
 
@@ -65,15 +67,40 @@ func run(cfg *Config) error {
 	}
 	awsCfg, err := config.LoadDefaultConfig(ctx, awsOpts...)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot load aws config: %w", err)
 	}
 	ec2Client := ec2.NewFromConfig(awsCfg)
 
+	err = cleanupExisting(ctx, cfg, ec2Client)
+	if err != nil {
+		return fmt.Errorf("cannot cleanup existing instances: %w", err)
+	}
+
+	runner := worker.NewRunner(worker.RunnerParams{
+		IsFatal: func(err error) bool {
+			return false
+		},
+		ShouldRestart: func(err error) bool {
+			return false
+		},
+		Clock:  clock.WallClock,
+		Logger: logrus.New(),
+	})
+	defer func() {
+		runner.Kill()
+		err := runner.Wait()
+		if err != nil {
+			logrus.Errorf("runner: %v", err)
+		}
+	}()
 	backend := &Backend{
 		client: ec2Client,
 		config: cfg,
 		execs:  map[string]Exec{},
+		names:  map[string]string{},
+		runner: runner,
 	}
+
 	decoder := runconfig.ContainerDecoder{
 		GetSysInfo: func() *sysinfo.SysInfo {
 			return &sysinfo.SysInfo{}

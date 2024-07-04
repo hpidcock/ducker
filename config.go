@@ -13,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/docker/docker/errdefs"
 	"gopkg.in/yaml.v2"
 )
@@ -27,10 +26,10 @@ type Config struct {
 }
 
 type ImageConfig struct {
+	Name               string
 	AMI                string            `yaml:"ami"`
 	AMIOwners          []string          `yaml:"ami-owners"`
 	InstanceType       string            `yaml:"instance-type"`
-	UserData           string            `yaml:"user-data"`
 	StartScript        string            `yaml:"start-script"`
 	IAMInstanceProfile string            `yaml:"iam-instance-profile"`
 	Tags               map[string]string `yaml:"tags"`
@@ -87,8 +86,10 @@ func ReadConfig(file string) (*Config, error) {
 	config.AWS.Region = os.ExpandEnv(config.AWS.Region)
 	config.AWS.AccessKeyId = os.ExpandEnv(config.AWS.AccessKeyId)
 	config.AWS.SecretAccessKey = os.ExpandEnv(config.AWS.SecretAccessKey)
-
-	spew.Dump(config)
+	for k, v := range config.Images {
+		v.Name = k
+		config.Images[k] = v
+	}
 
 	return config, nil
 }

@@ -7,14 +7,11 @@ import (
 	"io"
 	"math/rand"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
@@ -24,18 +21,17 @@ import (
 	"github.com/docker/docker/pkg/archive"
 	petname "github.com/dustinkirkland/golang-petname"
 	"github.com/juju/cmd/v3"
-	"github.com/juju/utils/v3"
+	"github.com/juju/errors"
 	"github.com/juju/utils/v3/ssh"
+	"github.com/juju/worker/v3"
+	"github.com/kballard/go-shellquote"
 	"github.com/sirupsen/logrus"
 	cryptossh "golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v2"
 )
 
 func (b *Backend) ContainerExecCreate(name string, config *types.ExecConfig) (string, error) {
 	logrus.Infof("ContainerExecCreate %s %#v", name, config)
-	if !strings.HasPrefix(name, "i-") {
-		return "", errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
-	}
-
 	if config.Detach {
 		return "", errdefs.InvalidParameter(fmt.Errorf("detach not supported"))
 	}
@@ -52,24 +48,20 @@ func (b *Backend) ContainerExecCreate(name string, config *types.ExecConfig) (st
 		return "", errdefs.InvalidParameter(fmt.Errorf("missing cmd param"))
 	}
 
-	b.execsMutex.Lock()
-	defer b.execsMutex.Unlock()
-	res, err := b.client.DescribeInstances(context.Background(), &ec2.DescribeInstancesInput{
-		InstanceIds: []string{name},
-	})
+	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {
 		return "", err
 	}
-	if res.Reservations[0].Instances[0].State.Name != "running" {
-		return "", errdefs.FromStatusCode(fmt.Errorf("instance %s is not running", name), 409)
-	}
+
+	b.execsMutex.Lock()
+	defer b.execsMutex.Unlock()
 
 	bytes := [16]byte{}
 	_, _ = rand.Read(bytes[:])
 	id := hex.EncodeToString(bytes[:])
 	e := Exec{
 		ID:       id,
-		Instance: name,
+		Instance: instance.ID(),
 		Config:   *config,
 	}
 	b.execs[id] = e
@@ -80,15 +72,16 @@ func (b *Backend) ContainerExecCreate(name string, config *types.ExecConfig) (st
 func (b *Backend) ContainerExecInspect(id string) (*backend.ExecInspect, error) {
 	logrus.Infof("ContainerExecInspect %s", id)
 	b.execsMutex.Lock()
+	defer b.execsMutex.Unlock()
 	execConfig, ok := b.execs[id]
-	b.execsMutex.Unlock()
 	if !ok {
 		return nil, errdefs.NotFound(fmt.Errorf("exec %s not found", id))
 	}
 	res := &backend.ExecInspect{
-		ID:       id,
-		ExitCode: execConfig.ExitCode,
-		Running:  execConfig.Running,
+		ID:          id,
+		ContainerID: execConfig.Instance,
+		ExitCode:    execConfig.ExitCode,
+		Running:     execConfig.Running,
 		ProcessConfig: &backend.ExecProcessConfig{
 			Entrypoint: execConfig.Config.Cmd[0],
 			Arguments:  execConfig.Config.Cmd[1:],
@@ -114,7 +107,12 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 		return errdefs.NotFound(fmt.Errorf("exec %s not found", name))
 	}
 
-	info, err := b.waitForRunningInfo(context.Background(), execConfig.Instance)
+	instance, err := b.findInstance(ctx, execConfig.Instance)
+	if err != nil {
+		return err
+	}
+
+	info, err := instance.RunningInfo(ctx)
 	if err != nil {
 		return err
 	}
@@ -166,9 +164,10 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 	}
 
 	b.execsMutex.Lock()
-	execConfig = b.execs[name]
-	execConfig.Running = true
-	b.execs[name] = execConfig
+	if updateExecConfig, ok := b.execs[name]; ok {
+		updateExecConfig.Running = true
+		b.execs[name] = updateExecConfig
+	}
 	b.execsMutex.Unlock()
 
 	logrus.Debugf("exec %s waiting", name)
@@ -177,11 +176,12 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 	exitCode := 0
 	defer func() {
 		b.execsMutex.Lock()
-		execConfig = b.execs[name]
-		execConfig.Running = false
-		execConfig.ExitCode = &exitCode
-		b.execs[name] = execConfig
-		b.execsMutex.Unlock()
+		defer b.execsMutex.Unlock()
+		if updateExecConfig, ok := b.execs[name]; ok {
+			updateExecConfig.Running = false
+			updateExecConfig.ExitCode = &exitCode
+			b.execs[name] = updateExecConfig
+		}
 	}()
 	if execErr, ok := err.(*exec.ExitError); ok {
 		exitCode = execErr.ExitCode()
@@ -198,6 +198,8 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 
 func (b *Backend) ExecExists(name string) (bool, error) {
 	logrus.Infof("ExecExists %s", name)
+	b.execsMutex.Lock()
+	defer b.execsMutex.Unlock()
 	_, ok := b.execs[name]
 	return ok, nil
 }
@@ -219,11 +221,15 @@ func (b *Backend) ContainerExport(name string, out io.Writer) error {
 
 func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwriteDirNonDir bool, content io.Reader) error {
 	logrus.Infof("ContainerExtractToDir %s %s", name, path)
-	if !strings.HasPrefix(name, "i-") {
-		return errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
+
+	instance, err := b.findInstance(context.Background(), name)
+	if err != nil {
+		return err
 	}
 
-	info, err := b.waitForRunningInfo(context.Background(), name)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	info, err := instance.RunningInfo(ctx)
 	if err != nil {
 		return err
 	}
@@ -254,9 +260,65 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 	return nil
 }
 
-func (b *Backend) ContainerStatPath(name string, path string) (stat *types.ContainerPathStat, err error) {
-	spew.Dump("ContainerStatPath", name, path)
-	return nil, errNotImplemented
+func (b *Backend) ContainerStatPath(name string, path string) (*types.ContainerPathStat, error) {
+	logrus.Infof("ContainerStatPath %s %s", name, path)
+	if !strings.HasPrefix(name, "i-") {
+		return nil, errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
+	}
+
+	done := make(chan struct{})
+	close(done)
+	worker, err := b.runner.Worker(name, done)
+	if errors.Is(err, errors.NotFound) {
+		return nil, errdefs.NotFound(fmt.Errorf("container %q not found", name))
+	} else if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	instance := worker.(Instance)
+	ri, err := instance.RunningInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: find image config and get username from there
+	host := ri.Image.DefaultUser + "@" + ri.IP
+
+	opts := ssh.Options{}
+	opts.SetIdentities(b.config.SSH.IdentityFile)
+	opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
+	cmd := ssh.Command(host, []string{"stat", "-c", shellquote.Join("name: %n\nmode: %f\nsize: %s\nmod: %Y\ntype: %F\n"), path}, &opts)
+	out, err := cmd.CombinedOutput()
+	logrus.Debugln(string(out))
+	if err != nil {
+		return nil, err
+	}
+
+	var info struct {
+		Name    string `yaml:"name"`
+		Size    int64  `yaml:"size"`
+		Mode    string `yaml:"mode"`
+		Mod     int64  `yaml:"mod"`
+		EntType string `yaml:"type"`
+	}
+	err = yaml.Unmarshal(out, &info)
+	if err != nil {
+		return nil, err
+	}
+	mode, err := strconv.ParseUint(info.Mode, 16, 32)
+	if err != nil {
+		return nil, err
+	}
+	stat := types.ContainerPathStat{
+		Name:       info.Name,
+		Size:       info.Size,
+		Mode:       fileModeFromUnixMode(uint32(mode)),
+		Mtime:      time.Unix(info.Mod, 0),
+		LinkTarget: "",
+	}
+	return &stat, nil
 }
 
 func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container.ContainerCreateCreatedBody, error) {
@@ -264,130 +326,39 @@ func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container
 	if config.Name == "" {
 		config.Name = petname.Generate(2, "-")
 	}
-
-	ref, err := reference.Parse(config.Config.Image)
-	if err != nil {
-		return container.ContainerCreateCreatedBody{}, err
-	}
-	named, ok := ref.(reference.Named)
-	if !ok {
-		return container.ContainerCreateCreatedBody{},
-			errdefs.InvalidParameter(fmt.Errorf("%s does not name an image", config.Config.Image))
-	}
-	imageName := named.Name()
-	image, ok := b.config.Images[imageName]
-	if !ok {
-		return container.ContainerCreateCreatedBody{}, errdefs.NotFound(fmt.Errorf("%s not found", imageName))
-	}
-	ami, err := image.ResolveAMI(context.Background(), b.client)
-	if err != nil {
-		return container.ContainerCreateCreatedBody{}, err
-	}
-
-	vpcId := image.VPC
-	if vpcId == "" {
-		res, err := b.client.DescribeVpcs(context.Background(), &ec2.DescribeVpcsInput{
-			Filters: []ec2types.Filter{{Name: aws.String("is-default"), Values: []string{"true"}}},
-		})
-		if err != nil {
-			return container.ContainerCreateCreatedBody{}, err
-		}
-		if len(res.Vpcs) != 1 {
-			return container.ContainerCreateCreatedBody{}, errdefs.NotFound(fmt.Errorf("no default vpc"))
-		}
-		vpcId = *res.Vpcs[0].VpcId
-	}
-	subnets, err := b.client.DescribeSubnets(context.Background(), &ec2.DescribeSubnetsInput{
-		Filters: []ec2types.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcId}}},
-	})
-	if err != nil {
-		return container.ContainerCreateCreatedBody{}, err
-	}
-	if len(subnets.Subnets) == 0 {
-		return container.ContainerCreateCreatedBody{}, errdefs.NotFound(fmt.Errorf("no subnets found"))
-	}
-	rand.Shuffle(len(subnets.Subnets), func(i, j int) {
-		subnets.Subnets[i], subnets.Subnets[j] = subnets.Subnets[j], subnets.Subnets[i]
-	})
-
-	id := ""
-	for _, subnet := range subnets.Subnets {
-		subnetId := *subnet.SubnetId
-
-		req := &ec2.RunInstancesInput{
-			MaxCount:         aws.Int32(1),
-			MinCount:         aws.Int32(1),
-			ImageId:          aws.String(ami),
-			InstanceType:     ec2types.InstanceType(image.InstanceType),
-			KeyName:          aws.String(b.config.SSH.KeyPair),
-			SecurityGroupIds: image.SecurityGroups,
-			SubnetId:         aws.String(subnetId),
-		}
-		if image.IAMInstanceProfile != "" {
-			req.IamInstanceProfile = &ec2types.IamInstanceProfileSpecification{
-				Arn: aws.String(image.IAMInstanceProfile),
+	b.namesMutex.Lock()
+	_, ok := b.names[config.Name]
+	if ok {
+		b.namesMutex.Unlock()
+		return container.ContainerCreateCreatedBody{}, errdefs.Conflict(fmt.Errorf("container %s already exists", config.Name))
+	} else {
+		b.names[config.Name] = "reserved"
+		b.namesMutex.Unlock()
+		defer func() {
+			b.namesMutex.Lock()
+			defer b.namesMutex.Unlock()
+			if id, ok := b.names[config.Name]; ok && id == "reserved" {
+				delete(b.names, config.Name)
 			}
-		}
-		if image.UserData != "" {
-			req.UserData = aws.String(image.UserData)
-		}
-
-		tags := []ec2types.Tag{
-			{Key: aws.String("Name"), Value: aws.String(config.Name)},
-			{Key: aws.String("ducker"), Value: aws.String(b.config.Namespace)},
-			{Key: aws.String("image"), Value: aws.String(imageName)},
-		}
-		for k, v := range config.Config.Labels {
-			tags = append(tags, ec2types.Tag{Key: aws.String(k), Value: aws.String(v)})
-		}
-
-		req.TagSpecifications = []ec2types.TagSpecification{{
-			ResourceType: ec2types.ResourceTypeInstance,
-			Tags:         tags,
-		}}
-
-		resp, err := b.client.RunInstances(context.Background(), req)
-		if err != nil && (strings.Contains(err.Error(), "InsufficientInstanceCapacity") ||
-			strings.Contains(err.Error(), "Unsupported")) {
-			logrus.Errorf("retrying due to failure creating instance: %s", err.Error())
-			continue
-		} else if err != nil {
-			return container.ContainerCreateCreatedBody{}, err
-		}
-
-		id = *resp.Instances[0].InstanceId
-		break
-	}
-	if id == "" {
-		return container.ContainerCreateCreatedBody{}, errdefs.Deadline(fmt.Errorf("failed to create container"))
+		}()
 	}
 
-	logrus.Debugf("%s: waiting", id)
-	info, err := b.waitForRunningInfo(context.Background(), id)
+	instance, err := CreateInstance(context.Background(), b, config)
 	if err != nil {
 		return container.ContainerCreateCreatedBody{}, err
 	}
-
-	logrus.Debugf("%s: waiting for cloud-init", id)
-	err = b.waitForCloudInit(context.Background(), info)
+	id := instance.ID()
+	err = b.runner.StartWorker(id, func() (worker.Worker, error) {
+		return instance, nil
+	})
 	if err != nil {
+		instance.Kill()
 		return container.ContainerCreateCreatedBody{}, err
 	}
 
-	if info.Image.StartScript != "" {
-		logrus.Debugf("%s: running start-script", id)
-		host := info.Image.DefaultUser + "@" + info.IP
-		opts := ssh.Options{}
-		opts.SetIdentities(b.config.SSH.IdentityFile)
-		opts.SetStrictHostKeyChecking(ssh.StrictHostChecksNo)
-		cmd := ssh.Command(host, []string{"/bin/bash", "-c", utils.ShQuote(info.Image.StartScript)}, &opts)
-		out, err := cmd.CombinedOutput()
-		logrus.Debugf("%s: start-script output: %s", id, string(out))
-		if err != nil {
-			return container.ContainerCreateCreatedBody{}, err
-		}
-	}
-
+	b.namesMutex.Lock()
+	b.names[config.Name] = id
+	b.namesMutex.Unlock()
 	return container.ContainerCreateCreatedBody{
 		ID: id,
 	}, nil
@@ -415,73 +386,71 @@ func (b *Backend) ContainerResize(name string, height, width int) error {
 
 func (b *Backend) ContainerRestart(name string, seconds *int) error {
 	logrus.Infof("ContainerRestart %s", name)
-	if !strings.HasPrefix(name, "i-") {
-		return errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
-	}
-
-	_, err := b.client.RebootInstances(context.Background(), &ec2.RebootInstancesInput{
-		InstanceIds: []string{name},
-	})
+	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {
 		return err
 	}
 
+	err = instance.Restart()
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
 func (b *Backend) ContainerRm(name string, config *types.ContainerRmConfig) error {
 	logrus.Infof("ContainerRm %s %#v", name, config)
-	if !strings.HasPrefix(name, "i-") {
-		return errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
+	instance, err := b.findInstance(context.Background(), name)
+	if err != nil {
+		return err
 	}
+	id := instance.ID()
 
 	b.execsMutex.Lock()
 	defer b.execsMutex.Unlock()
 	for k, v := range b.execs {
-		if v.Instance == name {
+		if v.Instance == id {
 			delete(b.execs, k)
 		}
 	}
 
-	_, err := b.client.TerminateInstances(context.Background(), &ec2.TerminateInstancesInput{
-		InstanceIds: []string{name},
-	})
-	if err != nil {
+	err = b.runner.StopWorker(id)
+	if errors.Is(err, worker.ErrDead) {
+	} else if err != nil {
 		return err
 	}
 
+	b.namesMutex.Lock()
+	defer b.namesMutex.Unlock()
+	delete(b.names, instance.Name())
 	return nil
 }
 
 func (b *Backend) ContainerStart(name string, hostConfig *container.HostConfig, checkpoint string, checkpointDir string) error {
 	logrus.Infof("ContainerStart %s", name)
-	if !strings.HasPrefix(name, "i-") {
-		return errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
-	}
-
-	_, err := b.client.StartInstances(context.Background(), &ec2.StartInstancesInput{
-		InstanceIds: []string{name},
-	})
+	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {
 		return err
 	}
 
+	err = instance.Start()
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
 func (b *Backend) ContainerStop(name string, seconds *int) error {
 	logrus.Infof("ContainerStop %s", name)
-	if !strings.HasPrefix(name, "i-") {
-		return errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
-	}
-
-	_, err := b.client.StopInstances(context.Background(), &ec2.StopInstancesInput{
-		InstanceIds: []string{name},
-	})
+	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {
 		return err
 	}
 
+	err = instance.Stop()
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -507,59 +476,34 @@ func (b *Backend) ContainerChanges(name string) ([]archive.Change, error) {
 
 func (b *Backend) ContainerInspect(name string, size bool, version string) (interface{}, error) {
 	logrus.Infof("ContainerInspect %s %s", name, version)
-
-	if !strings.HasPrefix(name, "i-") {
-		return nil, errdefs.InvalidParameter(fmt.Errorf("only ec2 instance id supported got %s", name))
-	}
-
-	res, err := b.client.DescribeInstances(context.Background(), &ec2.DescribeInstancesInput{
-		InstanceIds: []string{name},
-	})
+	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {
 		return nil, err
 	}
-	instance := res.Reservations[0].Instances[0]
+	id := instance.ID()
 
+	info, state := instance.ContainerInfo()
 	c := types.ContainerJSON{
-		ContainerJSONBase: &types.ContainerJSONBase{},
-	}
-	c.ID = *instance.InstanceId
-	c.Image = *instance.ImageId
-	c.Created = instance.LaunchTime.String()
-	c.State = &types.ContainerState{}
-	c.Config = &container.Config{
-		Labels: map[string]string{},
-		Image:  *instance.ImageId,
+		ContainerJSONBase: &types.ContainerJSONBase{
+			Created: time.Unix(info.Created, 0).String(),
+			ID:      info.ID,
+			Image:   info.ImageID,
+			Name:    info.Names[0],
+			State:   &state,
+		},
+		Config: &container.Config{
+			Image:  info.Image,
+			Labels: info.Labels,
+		},
 	}
 
-	for _, v := range instance.Tags {
-		if *v.Key == "Name" {
-			c.Name = *v.Value
-			continue
+	b.execsMutex.Lock()
+	defer b.execsMutex.Unlock()
+	for k, v := range b.execs {
+		if v.Instance == id {
+			c.ExecIDs = append(c.ExecIDs, k)
 		}
-		c.Config.Labels[*v.Key] = *v.Value
 	}
-	switch instance.State.Name {
-	case "pending":
-		c.State.Status = "created"
-	case "running":
-		c.State.Status = "running"
-		c.State.Running = true
-		c.State.StartedAt = c.Created
-	case "shutting-down":
-		c.State.Status = "exited"
-		c.State.FinishedAt = time.Now().String()
-	case "stopping":
-		c.State.Status = "exited"
-		c.State.FinishedAt = time.Now().String()
-	case "stopped":
-		c.State.Status = "exited"
-		c.State.FinishedAt = time.Now().String()
-	case "terminated":
-		c.State.Status = "removing"
-		c.State.FinishedAt = time.Now().String()
-	}
-
 	return c, nil
 }
 
@@ -597,105 +541,22 @@ func (b *Backend) Containers(config *types.ContainerListOptions) ([]*types.Conta
 		logrus.Warnf("containers does not support since")
 	}
 
-	filters := []ec2types.Filter{{
-		Name:   aws.String("tag:ducker"),
-		Values: []string{b.config.Namespace},
-	}}
-	if config.All {
-		filters = append(filters, ec2types.Filter{
-			Name:   aws.String("instance-state-name"),
-			Values: []string{"pending", "running"},
-		})
-	} else {
-		filters = append(filters, ec2types.Filter{
-			Name:   aws.String("instance-state-name"),
-			Values: []string{"pending", "running", "shutting-down", "stopping", "stopped"},
-		})
-	}
-	for _, k := range config.Filters.Keys() {
-		values := config.Filters.Get(k)
-		switch k {
-		case "name":
-			filters = append(filters, ec2types.Filter{
-				Name:   aws.String("tag:Name"),
-				Values: values,
-			})
-		case "label":
-			for _, v := range values {
-				kv := strings.SplitN(v, "=", 2)
-				if len(kv) != 2 {
-					return nil, errdefs.InvalidParameter(fmt.Errorf("invalid label filter value %q", v))
-				}
-				key := kv[0]
-				value := kv[1]
-				filters = append(filters, ec2types.Filter{
-					Name:   aws.String(fmt.Sprintf("tag:%s", key)),
-					Values: []string{value},
-				})
-			}
-		case "id":
-			filters = append(filters, ec2types.Filter{
-				Name:   aws.String("instance-id"),
-				Values: values,
-			})
-		default:
-			return nil, errdefs.NotImplemented(fmt.Errorf("unsupported filter %s", k))
-		}
-	}
+	closedChan := make(chan struct{})
+	close(closedChan)
 
-	req := &ec2.DescribeInstancesInput{
-		Filters: filters,
-	}
-	instances := []ec2types.Instance{}
-	for {
-		resp, err := b.client.DescribeInstances(context.Background(), req)
+	// containers cannot be nil, must be at least an empty list
+	// for jenkins docker plugin.
+	containers := []*types.Container{}
+
+	workers := b.runner.WorkerNames()
+	for _, id := range workers {
+		worker, err := b.runner.Worker(id, closedChan)
 		if err != nil {
-			return nil, err
-		}
-		for _, v := range resp.Reservations {
-			instances = append(instances, v.Instances...)
-		}
-		if resp.NextToken != nil {
-			req.NextToken = resp.NextToken
 			continue
 		}
-		break
-	}
-
-	containers := []*types.Container{}
-	for _, instance := range instances {
-		container := types.Container{
-			ID:     *instance.InstanceId,
-			Labels: make(map[string]string),
-		}
-		for _, v := range instance.Tags {
-			if *v.Key == "Name" {
-				container.Names = append(container.Names, *v.Value)
-				continue
-			}
-			container.Labels[*v.Key] = *v.Value
-		}
-		container.Image = *instance.ImageId
-		container.ImageID = *instance.ImageId
-		switch instance.State.Name {
-		case "pending":
-			container.State = "created"
-		case "running":
-			container.State = "running"
-		case "shutting-down":
-			container.State = "exited"
-		case "stopping":
-			container.State = "exited"
-		case "stopped":
-			container.State = "exited"
-		case "terminated":
-			container.State = "removing"
-		default:
-			container.State = "unknown"
-		}
-		container.Status = string(instance.State.Name)
-		container.Created = instance.LaunchTime.Unix()
-		containers = append(containers, &container)
+		instance := worker.(Instance)
+		info, _ := instance.ContainerInfo()
+		containers = append(containers, &info)
 	}
 
 	return containers, nil
