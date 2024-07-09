@@ -90,6 +90,7 @@ type awsInstance struct {
 	started  time.Time
 	finished time.Time
 	image    ImageConfig
+	labels   map[string]string
 
 	runStartScript bool
 
@@ -572,6 +573,18 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 		subnets.Subnets[i], subnets.Subnets[j] = subnets.Subnets[j], subnets.Subnets[i]
 	})
 
+	labels := map[string]string{
+		"Name":   config.Name,
+		"ducker": n.b.config.Namespace,
+		"image":  imageName,
+	}
+	for k, v := range image.Tags {
+		labels[k] = v
+	}
+	for k, v := range config.Config.Labels {
+		labels[k] = v
+	}
+
 	id := ""
 	for _, subnet := range subnets.Subnets {
 		subnetId := *subnet.SubnetId
@@ -596,12 +609,8 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 			[]byte(fmt.Sprintf(cloudInitScript, n.nonce)),
 		))
 
-		tags := []ec2types.Tag{
-			{Key: aws.String("Name"), Value: aws.String(config.Name)},
-			{Key: aws.String("ducker"), Value: aws.String(n.b.config.Namespace)},
-			{Key: aws.String("image"), Value: aws.String(imageName)},
-		}
-		for k, v := range config.Config.Labels {
+		tags := []ec2types.Tag{}
+		for k, v := range labels {
 			tags = append(tags, ec2types.Tag{Key: aws.String(k), Value: aws.String(v)})
 		}
 
@@ -629,6 +638,7 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 	n.id = id
 	n.name = config.Name
 	n.image = image
+	n.labels = labels
 	n.created = time.Now().UTC()
 	n.updateContainerInfo()
 	return n.enterCreating()
@@ -644,7 +654,7 @@ func (n *awsInstance) updateContainerInfo() {
 		Image:   n.image.Name,
 		ImageID: n.image.AMI,
 		Created: n.created.Unix(),
-		Labels:  n.image.Tags,
+		Labels:  n.labels,
 	}
 	n.containerState = types.ContainerState{}
 	if !n.started.IsZero() {
