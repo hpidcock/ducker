@@ -378,6 +378,14 @@ func (n *awsInstance) enterStopped() error {
 }
 
 func (n *awsInstance) stopped() error {
+	s, err := n.status(n.ctx())
+	if err != nil {
+		return err
+	}
+	switch s.State.Name {
+	case "terminated":
+		return n.enterTerminated()
+	}
 	return nil
 }
 
@@ -420,6 +428,16 @@ func (n *awsInstance) enterRunning() error {
 }
 
 func (n *awsInstance) running() error {
+	s, err := n.status(n.ctx())
+	if err != nil {
+		return err
+	}
+	switch s.State.Name {
+	case "terminated":
+		return n.enterTerminated()
+	case "stopped":
+		return n.enterStopped()
+	}
 	return nil
 }
 
@@ -574,9 +592,10 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 	})
 
 	labels := map[string]string{
-		"Name":   config.Name,
-		"ducker": n.b.config.Namespace,
-		"image":  imageName,
+		"Name":      config.Name,
+		"ducker":    n.b.config.Namespace,
+		"image":     imageName,
+		"permanent": "true",
 	}
 	for k, v := range image.Tags {
 		labels[k] = v
