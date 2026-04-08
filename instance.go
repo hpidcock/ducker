@@ -326,7 +326,9 @@ func (n *awsInstance) cloudInit() error {
 	if err != nil {
 		return fmt.Errorf("cannot open connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	logrus.Infof("%s: confirming host key...", n.id)
 	sess, err := conn.NewSession()

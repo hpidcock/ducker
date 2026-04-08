@@ -3,10 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"strconv"
 	"time"
@@ -131,7 +131,9 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 	if err != nil {
 		return fmt.Errorf("cannot open connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	sess, err := conn.NewSession()
 	if err != nil {
@@ -251,7 +253,9 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 	if err != nil {
 		return fmt.Errorf("cannot open connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	sess, err := conn.NewSession()
 	if err != nil {
@@ -302,7 +306,9 @@ func (b *Backend) ContainerStatPath(name string, path string) (*types.ContainerP
 	if err != nil {
 		return nil, fmt.Errorf("cannot open connection: %w", err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	sess, err := conn.NewSession()
 	if err != nil {

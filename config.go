@@ -75,7 +75,10 @@ func ReadConfig(file string) (*Config, error) {
 		}
 		for k, v := range kv.Env {
 			k = strings.ToUpper(strings.ReplaceAll(k, "-", "_"))
-			os.Setenv(k, v)
+			err := os.Setenv(k, v)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
