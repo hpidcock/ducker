@@ -36,6 +36,11 @@ type ImageConfig struct {
 	SecurityGroups     []string          `yaml:"security-groups"`
 	DefaultUser        string            `yaml:"default-user"`
 	VPC                string            `yaml:"vpc"`
+	// Spot enables EC2 spot instance market pricing.
+	Spot bool `yaml:"spot"`
+	// SpotMaxPrice sets an optional maximum hourly price for spot
+	// instances. When empty, the current spot price is used.
+	SpotMaxPrice string `yaml:"spot-max-price"`
 }
 
 type SSHConfig struct {

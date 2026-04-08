@@ -617,6 +617,18 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 			SecurityGroupIds: image.SecurityGroups,
 			SubnetId:         aws.String(subnetId),
 		}
+		if image.Spot {
+			spotOpts := &ec2types.SpotMarketOptions{
+				InstanceInterruptionBehavior: ec2types.InstanceInterruptionBehaviorTerminate,
+			}
+			if image.SpotMaxPrice != "" {
+				spotOpts.MaxPrice = aws.String(image.SpotMaxPrice)
+			}
+			req.InstanceMarketOptions = &ec2types.InstanceMarketOptionsRequest{
+				MarketType:  ec2types.MarketTypeSpot,
+				SpotOptions: spotOpts,
+			}
+		}
 		if image.IAMInstanceProfile != "" {
 			req.IamInstanceProfile = &ec2types.IamInstanceProfileSpecification{
 				Arn: aws.String(image.IAMInstanceProfile),
