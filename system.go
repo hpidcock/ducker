@@ -30,11 +30,11 @@ func (b *Backend) SystemDiskUsage(ctx context.Context, opts system.DiskUsageOpti
 	return nil, errNotImplemented
 }
 
-func (b *Backend) SubscribeToEvents(since, until time.Time, ef filters.Args) ([]events.Message, chan interface{}) {
+func (b *Backend) SubscribeToEvents(since, until time.Time, ef filters.Args) ([]events.Message, chan any) {
 	panic("not implemented")
 }
 
-func (b *Backend) UnsubscribeFromEvents(chan interface{}) {
+func (b *Backend) UnsubscribeFromEvents(chan any) {
 	panic("not implemented")
 }
 

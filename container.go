@@ -493,7 +493,7 @@ func (b *Backend) ContainerChanges(name string) ([]archive.Change, error) {
 	return nil, errNotImplemented
 }
 
-func (b *Backend) ContainerInspect(name string, size bool, version string) (interface{}, error) {
+func (b *Backend) ContainerInspect(name string, size bool, version string) (any, error) {
 	logrus.Infof("ContainerInspect %s %s", name, version)
 	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {

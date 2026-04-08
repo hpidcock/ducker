@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+
 	"os"
 	"os/signal"
 	"syscall"
@@ -78,7 +78,7 @@ func run(cfg *Config) error {
 		return fmt.Errorf("cannot cleanup existing instances: %w", err)
 	}
 
-	key, err := ioutil.ReadFile(cfg.SSH.IdentityFile)
+	key, err := os.ReadFile(cfg.SSH.IdentityFile)
 	if err != nil {
 		return fmt.Errorf("cannot parse key file %s: %w", cfg.SSH.IdentityFile, err)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"math/rand"
 	"net"
 	"strings"
@@ -597,12 +598,8 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 		"image":     imageName,
 		"permanent": "true",
 	}
-	for k, v := range image.Tags {
-		labels[k] = v
-	}
-	for k, v := range config.Config.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, image.Tags)
+	maps.Copy(labels, config.Config.Labels)
 
 	id := ""
 	for _, subnet := range subnets.Subnets {
@@ -637,7 +634,7 @@ func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateCo
 
 		n.nonce = petname.Generate(5, "-")
 		req.UserData = aws.String(base64.StdEncoding.EncodeToString(
-			[]byte(fmt.Sprintf(cloudInitScript, n.nonce)),
+			fmt.Appendf(nil, cloudInitScript, n.nonce),
 		))
 
 		tags := []ec2types.Tag{}
