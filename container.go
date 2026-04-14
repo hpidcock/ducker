@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -263,32 +262,29 @@ func (b *Backend) ContainerExport(ctx context.Context, name string, out io.Write
 func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwriteDirNonDir bool, content io.Reader) error {
 	logrus.Infof("ContainerExtractToDir %s %s", name, path)
 
-	instance, err := b.findInstance(context.Background(), name)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	instance, err := b.findInstance(ctx, name)
 	if err != nil {
 		return err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
 	info, err := instance.RunningInfo(ctx)
 	if err != nil {
 		return err
 	}
 
-	// TODO: find image config and get username from there
-	host := info.Image.DefaultUser + "@" + info.IP
-
-	destPath := fmt.Sprintf("/tmp/ducker-%s", petname.Generate(3, "-"))
-
-	logrus.Infof("%s: copying to %s:%s", name, host, destPath)
-
-	conn, err := ssh.Dial("tcp", net.JoinHostPort(info.IP, "22"), &ssh.ClientConfig{
-		User: info.Image.DefaultUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(b.signers...),
+	conn, err := ssh.Dial(
+		"tcp",
+		net.JoinHostPort(info.IP, "22"),
+		&ssh.ClientConfig{
+			User: info.Image.DefaultUser,
+			Auth: []ssh.AuthMethod{
+				ssh.PublicKeys(b.signers...),
+			},
+			HostKeyCallback: ssh.FixedHostKey(info.HostKey),
 		},
-		HostKeyCallback: ssh.FixedHostKey(info.HostKey),
-	})
+	)
 	if err != nil {
 		return fmt.Errorf("cannot open connection: %w", err)
 	}
@@ -296,29 +292,23 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 		_ = conn.Close()
 	}()
 
+	logrus.Infof(
+		"%s: extracting tar to %s@%s:%s",
+		name, info.Image.DefaultUser, info.IP, path,
+	)
 	sess, err := conn.NewSession()
 	if err != nil {
 		return fmt.Errorf("cannot open session: %w", err)
 	}
 	sess.Stdin = content
-	combined := &bytes.Buffer{}
-	sess.Stderr = combined
-	sess.Stdout = combined
-	err = sess.Run(fmt.Sprintf("cat - > %s", destPath))
-	if err != nil {
-		return fmt.Errorf("cannot write file %s: %w\n%s", destPath, err, combined.String())
-	}
-
-	logrus.Infof("%s: extracting %s:%s to %s:%s", name, host, destPath, host, path)
-	sess, err = conn.NewSession()
-	if err != nil {
-		return fmt.Errorf("cannot open session: %w", err)
-	}
-	out, err := sess.CombinedOutput(fmt.Sprintf(
-		"sudo tar -xvf %s -C %s", destPath, shellquote.Join(path)))
+	out, err := sess.CombinedOutput(
+		"sudo tar -xf - -C " + shellquote.Join(path),
+	)
 	logrus.Debugln(string(out))
 	if err != nil {
-		return err
+		return fmt.Errorf(
+			"cannot extract to %s: %w\n%s", path, err, string(out),
+		)
 	}
 	return nil
 }
