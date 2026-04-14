@@ -61,6 +61,9 @@ type Exec struct {
 	Config   types.ExecConfig
 	Running  bool
 	ExitCode *int
+	// resize receives terminal dimension updates when Tty is true.
+	// It is nil for non-TTY execs.
+	resize chan [2]int
 }
 
 var (

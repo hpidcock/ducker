@@ -62,6 +62,9 @@ func (b *Backend) ContainerExecCreate(name string, config *types.ExecConfig) (st
 		Instance: instance.ID(),
 		Config:   *config,
 	}
+	if config.Tty {
+		e.resize = make(chan [2]int, 1)
+	}
 	b.execs[id] = e
 
 	return id, nil
@@ -92,7 +95,22 @@ func (b *Backend) ContainerExecInspect(id string) (*backend.ExecInspect, error) 
 
 func (b *Backend) ContainerExecResize(name string, height, width int) error {
 	logrus.Infof("ContainerExecResize %s %d %d", name, height, width)
-	return errNotImplemented
+	b.execsMutex.Lock()
+	execConfig, ok := b.execs[name]
+	b.execsMutex.Unlock()
+	if !ok {
+		return errdefs.NotFound(fmt.Errorf("exec %s not found", name))
+	}
+	if execConfig.resize == nil {
+		return nil
+	}
+	// Drain any pending resize so we always send the latest dimensions.
+	select {
+	case <-execConfig.resize:
+	default:
+	}
+	execConfig.resize <- [2]int{height, width}
+	return nil
 }
 
 func (b *Backend) ContainerExecStart(ctx context.Context, name string, options container.ExecStartOptions) (err error) {
@@ -140,13 +158,23 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, options c
 		return fmt.Errorf("cannot open session: %w", err)
 	}
 
+	if execConfig.Config.Tty {
+		// Request a PTY with sane defaults; the client will follow up
+		// with ContainerExecResize to set the real dimensions.
+		err = sess.RequestPty("xterm-256color", 24, 80, ssh.TerminalModes{})
+		if err != nil {
+			return fmt.Errorf("cannot request pty: %w", err)
+		}
+	}
 	if execConfig.Config.AttachStdin && options.Stdin != nil {
 		sess.Stdin = options.Stdin
 	}
 	if execConfig.Config.AttachStdout && options.Stdout != nil {
 		sess.Stdout = options.Stdout
 	}
-	if execConfig.Config.AttachStderr && options.Stderr != nil {
+	// On a TTY stderr is merged into stdout by the PTY; setting it
+	// separately would duplicate output.
+	if execConfig.Config.AttachStderr && options.Stderr != nil && !execConfig.Config.Tty {
 		sess.Stderr = options.Stderr
 	}
 	err = sess.Start(shellquote.Join(execConfig.Config.Cmd...))
@@ -164,15 +192,26 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, options c
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		select {
-		case <-ctx.Done():
-			logrus.Infof("canceling exec %s", execConfig.ID)
-			err := sess.Signal(ssh.SIGINT)
-			if err != nil {
-				logrus.Infof("canceling exec %s: %v", execConfig.ID, err)
+		// execConfig.resize is nil for non-TTY execs; a nil channel
+		// is never selected, so this loop is correct in both cases.
+		for {
+			select {
+			case <-ctx.Done():
+				logrus.Infof("canceling exec %s", execConfig.ID)
+				err := sess.Signal(ssh.SIGINT)
+				if err != nil {
+					logrus.Infof("canceling exec %s: %v", execConfig.ID, err)
+				}
+				return
+			case <-done:
+				logrus.Infof("exiting exec %s", execConfig.ID)
+				return
+			case dim := <-execConfig.resize:
+				err := sess.WindowChange(dim[0], dim[1])
+				if err != nil {
+					logrus.Infof("resize exec %s: %v", execConfig.ID, err)
+				}
 			}
-		case <-done:
-			logrus.Infof("exiting exec %s", execConfig.ID)
 		}
 	}()
 
