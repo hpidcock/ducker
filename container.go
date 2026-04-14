@@ -95,7 +95,7 @@ func (b *Backend) ContainerExecResize(name string, height, width int) error {
 	return errNotImplemented
 }
 
-func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.Reader, stdout io.Writer, stderr io.Writer) (err error) {
+func (b *Backend) ContainerExecStart(ctx context.Context, name string, options container.ExecStartOptions) (err error) {
 	logrus.Infof("ContainerExecStart %s", name)
 
 	b.execsMutex.Lock()
@@ -140,14 +140,14 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, stdin io.
 		return fmt.Errorf("cannot open session: %w", err)
 	}
 
-	if execConfig.Config.AttachStdin && stdin != nil {
-		sess.Stdin = stdin
+	if execConfig.Config.AttachStdin && options.Stdin != nil {
+		sess.Stdin = options.Stdin
 	}
-	if execConfig.Config.AttachStdout && stdout != nil {
-		sess.Stdout = stdout
+	if execConfig.Config.AttachStdout && options.Stdout != nil {
+		sess.Stdout = options.Stdout
 	}
-	if execConfig.Config.AttachStderr && stderr != nil {
-		sess.Stderr = stderr
+	if execConfig.Config.AttachStderr && options.Stderr != nil {
+		sess.Stderr = options.Stderr
 	}
 	err = sess.Start(shellquote.Join(execConfig.Config.Cmd...))
 	if err != nil {
@@ -216,7 +216,7 @@ func (b *Backend) ContainerCopy(name string, res string) (io.ReadCloser, error) 
 	return nil, errNotImplemented
 }
 
-func (b *Backend) ContainerExport(name string, out io.Writer) error {
+func (b *Backend) ContainerExport(ctx context.Context, name string, out io.Writer) error {
 	spew.Dump("ContainerExport", name)
 	return errNotImplemented
 }
@@ -346,7 +346,7 @@ func (b *Backend) ContainerStatPath(name string, path string) (*types.ContainerP
 	return &stat, nil
 }
 
-func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container.ContainerCreateCreatedBody, error) {
+func (b *Backend) ContainerCreate(ctx context.Context, config backend.ContainerCreateConfig) (container.CreateResponse, error) {
 	logrus.Infof("ContainerCreate %#v", config)
 	if config.Name == "" {
 		config.Name = petname.Generate(2, "-")
@@ -355,7 +355,7 @@ func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container
 	_, ok := b.names[config.Name]
 	if ok {
 		b.namesMutex.Unlock()
-		return container.ContainerCreateCreatedBody{}, errdefs.Conflict(fmt.Errorf("container %s already exists", config.Name))
+		return container.CreateResponse{}, errdefs.Conflict(fmt.Errorf("container %s already exists", config.Name))
 	} else {
 		b.names[config.Name] = "reserved"
 		b.namesMutex.Unlock()
@@ -370,7 +370,7 @@ func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container
 
 	instance, err := CreateInstance(context.Background(), b, config)
 	if err != nil {
-		return container.ContainerCreateCreatedBody{}, err
+		return container.CreateResponse{}, err
 	}
 	id := instance.ID()
 	err = b.runner.StartWorker(id, func() (worker.Worker, error) {
@@ -378,19 +378,19 @@ func (b *Backend) ContainerCreate(config types.ContainerCreateConfig) (container
 	})
 	if err != nil {
 		instance.Kill()
-		return container.ContainerCreateCreatedBody{}, err
+		return container.CreateResponse{}, err
 	}
 
 	b.namesMutex.Lock()
 	b.names[config.Name] = id
 	b.namesMutex.Unlock()
-	return container.ContainerCreateCreatedBody{
+	return container.CreateResponse{
 		ID: id,
 	}, nil
 }
 
-func (b *Backend) ContainerKill(name string, sig uint64) error {
-	spew.Dump("ContainerKill", name, sig)
+func (b *Backend) ContainerKill(name string, signal string) error {
+	spew.Dump("ContainerKill", name, signal)
 	return errNotImplemented
 }
 
@@ -409,9 +409,9 @@ func (b *Backend) ContainerResize(name string, height, width int) error {
 	return errNotImplemented
 }
 
-func (b *Backend) ContainerRestart(name string, seconds *int) error {
+func (b *Backend) ContainerRestart(ctx context.Context, name string, options container.StopOptions) error {
 	logrus.Infof("ContainerRestart %s", name)
-	instance, err := b.findInstance(context.Background(), name)
+	instance, err := b.findInstance(ctx, name)
 	if err != nil {
 		return err
 	}
@@ -423,7 +423,7 @@ func (b *Backend) ContainerRestart(name string, seconds *int) error {
 	return nil
 }
 
-func (b *Backend) ContainerRm(name string, config *types.ContainerRmConfig) error {
+func (b *Backend) ContainerRm(name string, config *backend.ContainerRmConfig) error {
 	logrus.Infof("ContainerRm %s %#v", name, config)
 	instance, err := b.findInstance(context.Background(), name)
 	if err != nil {
@@ -451,9 +451,9 @@ func (b *Backend) ContainerRm(name string, config *types.ContainerRmConfig) erro
 	return nil
 }
 
-func (b *Backend) ContainerStart(name string, hostConfig *container.HostConfig, checkpoint string, checkpointDir string) error {
+func (b *Backend) ContainerStart(ctx context.Context, name string, checkpoint string, checkpointDir string) error {
 	logrus.Infof("ContainerStart %s", name)
-	instance, err := b.findInstance(context.Background(), name)
+	instance, err := b.findInstance(ctx, name)
 	if err != nil {
 		return err
 	}
@@ -465,9 +465,9 @@ func (b *Backend) ContainerStart(name string, hostConfig *container.HostConfig, 
 	return nil
 }
 
-func (b *Backend) ContainerStop(name string, seconds *int) error {
+func (b *Backend) ContainerStop(ctx context.Context, name string, options container.StopOptions) error {
 	logrus.Infof("ContainerStop %s", name)
-	instance, err := b.findInstance(context.Background(), name)
+	instance, err := b.findInstance(ctx, name)
 	if err != nil {
 		return err
 	}
@@ -494,14 +494,14 @@ func (b *Backend) ContainerWait(ctx context.Context, name string, condition cont
 	return nil, errNotImplemented
 }
 
-func (b *Backend) ContainerChanges(name string) ([]archive.Change, error) {
+func (b *Backend) ContainerChanges(ctx context.Context, name string) ([]archive.Change, error) {
 	spew.Dump("ContainerChanges", name)
 	return nil, errNotImplemented
 }
 
-func (b *Backend) ContainerInspect(name string, size bool, version string) (any, error) {
+func (b *Backend) ContainerInspect(ctx context.Context, name string, size bool, version string) (any, error) {
 	logrus.Infof("ContainerInspect %s %s", name, version)
-	instance, err := b.findInstance(context.Background(), name)
+	instance, err := b.findInstance(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -532,7 +532,7 @@ func (b *Backend) ContainerInspect(name string, size bool, version string) (any,
 	return c, nil
 }
 
-func (b *Backend) ContainerLogs(ctx context.Context, name string, config *types.ContainerLogsOptions) (msgs <-chan *backend.LogMessage, tty bool, err error) {
+func (b *Backend) ContainerLogs(ctx context.Context, name string, config *container.LogsOptions) (msgs <-chan *backend.LogMessage, tty bool, err error) {
 	spew.Dump("ContainerLogs", name, config)
 	return nil, false, errNotImplemented
 }
@@ -547,7 +547,7 @@ func (b *Backend) ContainerTop(name string, psArgs string) (*container.Container
 	return nil, errNotImplemented
 }
 
-func (b *Backend) Containers(config *types.ContainerListOptions) ([]*types.Container, error) {
+func (b *Backend) Containers(ctx context.Context, config *container.ListOptions) ([]*types.Container, error) {
 	logrus.Infof("Containers %#v", config)
 
 	if config.Size {
@@ -597,7 +597,7 @@ func (b *Backend) ContainersPrune(ctx context.Context, pruneFilters filters.Args
 	return &types.ContainersPruneReport{}, nil
 }
 
-func (b *Backend) CreateImageFromContainer(name string, config *backend.CreateImageConfig) (imageID string, err error) {
+func (b *Backend) CreateImageFromContainer(ctx context.Context, name string, config *backend.CreateImageConfig) (imageID string, err error) {
 	spew.Dump("CreateImageFromContainer", name, config)
 	return "", errNotImplemented
 }

@@ -3,7 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -119,22 +120,29 @@ func run(cfg *Config) error {
 		},
 	}
 	containerRouter := container.NewRouter(backend, decoder, false)
-	imageRouter := image.NewRouter(backend)
-	systemRouter := system.NewRouter(backend, nil, nil, &map[string]bool{})
+	imageRouter := image.NewRouter(backend, nil, nil, nil, nil)
+	systemRouter := system.NewRouter(
+		backend,
+		nil,
+		nil,
+		func() map[string]bool { return map[string]bool{} },
+	)
 
-	svr := server.New(&server.Config{
-		Logging: true,
-	})
-	svr.InitRouter(systemRouter, containerRouter, imageRouter)
+	svr := &server.Server{}
+	mux := svr.CreateMux(systemRouter, containerRouter, imageRouter)
 
 	ls, err := listeners.Init("tcp", cfg.Listen, "", nil)
 	if err != nil {
 		return err
 	}
-	svr.Accept(cfg.Listen, ls...)
 
-	errChan := make(chan error)
-	go svr.Wait(errChan)
+	httpSvr := &http.Server{Handler: mux}
+	errChan := make(chan error, len(ls))
+	for _, l := range ls {
+		go func(l net.Listener) {
+			errChan <- httpSvr.Serve(l)
+		}(l)
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

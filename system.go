@@ -9,21 +9,23 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/registry"
+	systypes "github.com/docker/docker/api/types/system"
 )
 
-func (b *Backend) SystemInfo() *types.Info {
-	return &types.Info{}
+func (b *Backend) SystemInfo(ctx context.Context) (*systypes.Info, error) {
+	return &systypes.Info{}, nil
 }
 
-func (b *Backend) SystemVersion() types.Version {
+func (b *Backend) SystemVersion(ctx context.Context) (types.Version, error) {
 	return types.Version{
 		Os:            runtime.GOOS,
 		Arch:          runtime.GOARCH,
-		Version:       "20.10.17",
-		APIVersion:    "1.41",
-		MinAPIVersion: "1.12",
+		Version:       "26.1.4",
+		APIVersion:    "1.45",
+		MinAPIVersion: "1.24",
 		GoVersion:     runtime.Version(),
-	}
+	}, nil
 }
 
 func (b *Backend) SystemDiskUsage(ctx context.Context, opts system.DiskUsageOptions) (*types.DiskUsage, error) {
@@ -38,6 +40,6 @@ func (b *Backend) UnsubscribeFromEvents(chan any) {
 	panic("not implemented")
 }
 
-func (b *Backend) AuthenticateToRegistry(ctx context.Context, authConfig *types.AuthConfig) (string, string, error) {
+func (b *Backend) AuthenticateToRegistry(ctx context.Context, authConfig *registry.AuthConfig) (string, string, error) {
 	return "", "", errNotImplemented
 }

@@ -14,8 +14,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/errdefs"
 	petname "github.com/dustinkirkland/golang-petname"
 	"github.com/juju/errors"
@@ -100,7 +101,7 @@ type awsInstance struct {
 	containerState     types.ContainerState
 }
 
-func CreateInstance(ctx context.Context, b *Backend, config types.ContainerCreateConfig) (Instance, error) {
+func CreateInstance(ctx context.Context, b *Backend, config backend.ContainerCreateConfig) (Instance, error) {
 	n := &awsInstance{
 		b:           b,
 		changeState: make(chan InstanceState),
@@ -549,7 +550,7 @@ func (n *awsInstance) terminated() error {
 	return nil
 }
 
-func (n *awsInstance) create(ctx context.Context, config types.ContainerCreateConfig) error {
+func (n *awsInstance) create(ctx context.Context, config backend.ContainerCreateConfig) error {
 	ref, err := reference.Parse(config.Config.Image)
 	if err != nil {
 		return err
