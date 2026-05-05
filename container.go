@@ -134,23 +134,33 @@ func (b *Backend) ContainerExecStart(ctx context.Context, name string, options c
 
 	user := execConfig.Config.User
 	if user == "" {
-		// TODO: find image config and get username from there
 		user = info.Image.DefaultUser
 	}
 
-	conn, err := ssh.Dial("tcp", net.JoinHostPort(info.IP, "22"), &ssh.ClientConfig{
-		User: user,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(b.signers...),
-		},
-		HostKeyCallback: ssh.FixedHostKey(info.HostKey),
-	})
-	if err != nil {
-		return fmt.Errorf("cannot open connection: %w", err)
+	var conn *ssh.Client
+	if user == info.Image.DefaultUser {
+		conn, err = instance.SSHClient(ctx)
+		if err != nil {
+			return err
+		}
+		// Shared persistent connection; do not close.
+	} else {
+		conn, err = ssh.Dial(
+			"tcp",
+			net.JoinHostPort(info.IP, "22"),
+			&ssh.ClientConfig{
+				User: user,
+				Auth: []ssh.AuthMethod{
+					ssh.PublicKeys(b.signers...),
+				},
+				HostKeyCallback: ssh.FixedHostKey(info.HostKey),
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("cannot open connection: %w", err)
+		}
+		defer func() { _ = conn.Close() }()
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
 
 	sess, err := conn.NewSession()
 	if err != nil {
@@ -269,33 +279,13 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 	if err != nil {
 		return err
 	}
-	info, err := instance.RunningInfo(ctx)
+	conn, err := instance.SSHClient(ctx)
 	if err != nil {
 		return err
 	}
+	// Shared persistent connection; do not close.
 
-	conn, err := ssh.Dial(
-		"tcp",
-		net.JoinHostPort(info.IP, "22"),
-		&ssh.ClientConfig{
-			User: info.Image.DefaultUser,
-			Auth: []ssh.AuthMethod{
-				ssh.PublicKeys(b.signers...),
-			},
-			HostKeyCallback: ssh.FixedHostKey(info.HostKey),
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("cannot open connection: %w", err)
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
-
-	logrus.Infof(
-		"%s: extracting tar to %s@%s:%s",
-		name, info.Image.DefaultUser, info.IP, path,
-	)
+	logrus.Infof("%s: extracting tar to %s", name, path)
 	sess, err := conn.NewSession()
 	if err != nil {
 		return fmt.Errorf("cannot open session: %w", err)
@@ -315,29 +305,19 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 
 func (b *Backend) ContainerStatPath(name string, path string) (*types.ContainerPathStat, error) {
 	logrus.Infof("ContainerStatPath %s %s", name, path)
-	instance, err := b.findInstance(context.Background(), name)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	instance, err := b.findInstance(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 
-	ri, err := instance.RunningInfo(context.Background())
+	conn, err := instance.SSHClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	conn, err := ssh.Dial("tcp", net.JoinHostPort(ri.IP, "22"), &ssh.ClientConfig{
-		User: ri.Image.DefaultUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(b.signers...),
-		},
-		HostKeyCallback: ssh.FixedHostKey(ri.HostKey),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cannot open connection: %w", err)
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
+	// Shared persistent connection; do not close.
 
 	sess, err := conn.NewSession()
 	if err != nil {

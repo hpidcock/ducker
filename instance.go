@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -45,6 +46,10 @@ type Instance interface {
 	ID() string
 	Name() string
 	RunningInfo(ctx context.Context) (*RunningInfo, error)
+	// SSHClient returns a cached SSH connection for the instance,
+	// waiting until it is Running. The returned client is shared;
+	// callers must not close it.
+	SSHClient(ctx context.Context) (*ssh.Client, error)
 	ContainerInfo() (types.Container, types.ContainerState)
 
 	Start() error
@@ -99,6 +104,9 @@ type awsInstance struct {
 	containerInfoMutex sync.RWMutex
 	containerInfo      types.Container
 	containerState     types.ContainerState
+
+	connMu sync.Mutex
+	conn   *ssh.Client
 }
 
 func CreateInstance(ctx context.Context, b *Backend, config backend.ContainerCreateConfig) (Instance, error) {
@@ -169,6 +177,79 @@ func (n *awsInstance) RunningInfo(ctx context.Context) (*RunningInfo, error) {
 	return runningInfo, nil
 }
 
+// SSHClient returns a cached SSH connection for the instance,
+// waiting until it reaches the Running state. The connection is
+// lazily created and automatically reconnected if it has been lost.
+// The returned client is shared; callers must not close it.
+func (n *awsInstance) SSHClient(ctx context.Context) (*ssh.Client, error) {
+	done := make(chan struct{})
+	ready := false
+	f := func() bool {
+		switch n.state {
+		case Creating, CloudInit, Restarting, Starting:
+			return true
+		case Running:
+			ready = true
+		}
+		close(done)
+		return false
+	}
+	select {
+	case n.runFunc <- f:
+	case <-n.tomb.Dying():
+		return nil, fmt.Errorf("instance terminating")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-done:
+	case <-n.tomb.Dying():
+		return nil, fmt.Errorf("instance terminating")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if !ready {
+		return nil, fmt.Errorf("instance not running")
+	}
+
+	n.connMu.Lock()
+	defer n.connMu.Unlock()
+	if n.conn != nil {
+		_, _, err := n.conn.SendRequest("keepalive@openssh.com", true, nil)
+		if err == nil {
+			return n.conn, nil
+		}
+		_ = n.conn.Close()
+		n.conn = nil
+		logrus.Infof("%s: ssh connection lost, reconnecting", n.id)
+	}
+	conn, err := ssh.Dial(
+		"tcp",
+		net.JoinHostPort(n.ip, "22"),
+		&ssh.ClientConfig{
+			User: n.image.DefaultUser,
+			Auth: []ssh.AuthMethod{
+				ssh.PublicKeys(n.b.signers...),
+			},
+			HostKeyCallback: ssh.FixedHostKey(n.hostKey),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open connection: %w", err)
+	}
+	n.conn = conn
+	return n.conn, nil
+}
+
+func (n *awsInstance) closeConn() {
+	n.connMu.Lock()
+	defer n.connMu.Unlock()
+	if n.conn != nil {
+		_ = n.conn.Close()
+		n.conn = nil
+	}
+}
+
 func (n *awsInstance) ContainerInfo() (types.Container, types.ContainerState) {
 	n.containerInfoMutex.RLock()
 	defer n.containerInfoMutex.RUnlock()
@@ -180,6 +261,7 @@ func (n *awsInstance) ctx() context.Context {
 }
 
 func (n *awsInstance) loop() error {
+	defer n.closeConn()
 	rerun := []func() bool(nil)
 	for {
 		select {
@@ -352,9 +434,9 @@ func (n *awsInstance) cloudInit() error {
 	if err != nil {
 		return fmt.Errorf("cannot open session: %w", err)
 	}
-	out, err = sess.CombinedOutput("sudo cloud-init status --wait")
-	if err != nil {
-		return fmt.Errorf("cloud-init failed: %w\n%s", err, string(out))
+	out, _ = sess.CombinedOutput("sudo cloud-init status --wait")
+	if !bytes.Contains(out, []byte("status: done")) {
+		return fmt.Errorf("cloud-init failed:\n%s", string(out))
 	}
 
 	if !n.runStartScript && n.image.StartScript != "" {
