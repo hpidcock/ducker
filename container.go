@@ -292,7 +292,7 @@ func (b *Backend) ContainerExtractToDir(name, path string, copyUIDGID, noOverwri
 	}
 	sess.Stdin = content
 	out, err := sess.CombinedOutput(
-		"sudo tar -xf - -C " + shellquote.Join(path),
+		"sudo tar -xzf - -C " + shellquote.Join(path),
 	)
 	logrus.Debugln(string(out))
 	if err != nil {
