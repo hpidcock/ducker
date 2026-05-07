@@ -4,15 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/errdefs"
 	dockerimage "github.com/docker/docker/image"
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -60,8 +63,47 @@ func (b *Backend) TagImage(ctx context.Context, id dockerimage.ID, newRef refere
 	return errNotImplemented
 }
 
-func (b *Backend) GetImage(ctx context.Context, refOrID string, opts backend.GetImageOpts) (*dockerimage.Image, error) {
-	return nil, errNotImplemented
+// GetImage returns image metadata for the named image, looked up against
+// the configured EC2 AMI image map.
+func (b *Backend) GetImage(
+	ctx context.Context,
+	refOrID string,
+	opts backend.GetImageOpts,
+) (*dockerimage.Image, error) {
+	ref, err := reference.ParseNormalizedNamed(refOrID)
+	if err != nil {
+		return nil, errdefs.InvalidParameter(err)
+	}
+	name := reference.FamiliarName(ref)
+	_, ok := b.config.Images[name]
+	if !ok {
+		return nil, errdefs.NotFound(
+			fmt.Errorf("%s not found", name))
+	}
+	arch := "amd64"
+	if strings.HasSuffix(name, "-arm64") {
+		arch = "arm64"
+	}
+	img := dockerimage.NewImage(
+		dockerimage.ID(digest.FromString(name)))
+	img.V1Image.Architecture = arch
+	img.V1Image.OS = "linux"
+	img.V1Image.Config = &container.Config{}
+	img.RootFS = &dockerimage.RootFS{Type: "layers"}
+	if opts.Details {
+		tagged, tagErr := reference.WithTag(
+			reference.TrimNamed(ref), "latest")
+		if tagErr == nil {
+			img.Details = &dockerimage.Details{
+				References: []reference.Named{tagged},
+			}
+		} else {
+			img.Details = &dockerimage.Details{
+				References: []reference.Named{ref},
+			}
+		}
+	}
+	return img, nil
 }
 
 func (b *Backend) ImagesPrune(ctx context.Context, pruneFilters filters.Args) (*types.ImagesPruneReport, error) {
