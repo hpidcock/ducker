@@ -688,6 +688,11 @@ func (n *awsInstance) create(ctx context.Context, config backend.ContainerCreate
 
 	id := ""
 	for _, subnet := range subnets.Subnets {
+		if subnet.MapPublicIpOnLaunch == nil ||
+			*subnet.MapPublicIpOnLaunch == false {
+			continue
+		}
+
 		subnetId := *subnet.SubnetId
 
 		req := &ec2.RunInstancesInput{
