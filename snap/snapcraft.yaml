@@ -5,7 +5,7 @@ description: |
   Intended to be used with the docker jenkins plugin.
 version: git
 grade: stable
-base: core22
+base: core24
 
 confinement: strict
 
@@ -22,6 +22,8 @@ parts:
     plugin: go
     source-type: git
     source: https://github.com/hpidcock/ducker
+    build-snaps:
+      - go/1.26/stable
     stage-packages:
       - openssh-client
 
