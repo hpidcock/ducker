@@ -72,6 +72,9 @@ func run(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("cannot load aws config: %w", err)
 	}
+	if awsCfg.Region == "" {
+		return fmt.Errorf("aws region is not configured")
+	}
 	ec2Client := ec2.NewFromConfig(awsCfg)
 
 	err = cleanupExisting(ctx, cfg, ec2Client)
